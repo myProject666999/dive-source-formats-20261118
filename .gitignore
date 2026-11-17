@@ -45,3 +45,9 @@ coverage.txt
 /build
 /_vendor*
 /vendor
+.env
+.env.*
+*.pem
+*.key
+secrets/
+*.token
