@@ -22,7 +22,7 @@ require (
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
 	github.com/google/uuid v1.6.0
 	github.com/gookit/color v1.5.4
-	github.com/klauspost/compress v1.20.2
+	github.com/klauspost/compress v1.20.4
 	github.com/lunixbochs/vtclean v1.0.0
 	github.com/mattn/go-runewidth v0.0.29
 	github.com/moby/moby/client v0.6.0
