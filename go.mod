@@ -24,7 +24,7 @@ require (
 	github.com/gookit/color v1.5.4
 	github.com/klauspost/compress v1.20.2
 	github.com/lunixbochs/vtclean v1.0.0
-	github.com/mattn/go-runewidth v0.0.29
+	github.com/mattn/go-runewidth v0.0.31
 	github.com/moby/moby/client v0.6.0
 	github.com/muesli/termenv v0.16.0
 	github.com/pelletier/go-toml/v2 v2.4.3
