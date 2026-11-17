@@ -11,6 +11,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -23,6 +25,9 @@ type Format int
 const (
 	// LegacySave is the `docker save` layout before docker 25: manifest.json, <id>/layer.tar, <hex>.json config.
 	LegacySave Format = iota
+	// PodmanSave is the `podman save` layout: manifest.json, flat <diffid-hex>.tar layers and a
+	// <hex>.json config, with no per layer VERSION/json files.
+	PodmanSave
 	// OCISave is the `docker save` layout from docker 25 on: an OCI layout (index.json, oci-layout, blobs/sha256/...)
 	// plus docker's manifest.json and repositories files.
 	OCISave
@@ -96,12 +101,56 @@ type dockerManifest struct {
 
 // Write writes the image tarball for the spec to w.
 func (s Spec) Write(w io.Writer) error {
+	files, err := s.files()
+	if err != nil {
+		return err
+	}
+	out := tar.NewWriter(w)
+	if err := writeSorted(out, files); err != nil {
+		return err
+	}
+	return out.Close()
+}
+
+// WriteDir writes the spec as an OCI image layout directory (index.json, oci-layout, blobs/), the
+// on-disk form an oci-dir source reads. Docker's manifest.json and repositories extras are left out.
+func (s Spec) WriteDir(dir string) error {
+	if s.Format != OCISave && s.Format != OCIArchive {
+		return fmt.Errorf("format %d has no OCI layout to write as a directory", s.Format)
+	}
+	files, err := s.files()
+	if err != nil {
+		return err
+	}
+	for _, name := range []string{"manifest.json", "repositories"} {
+		delete(files, name)
+	}
+	for name, data := range files {
+		path := filepath.Join(dir, filepath.FromSlash(name))
+		if data == nil {
+			if err := os.MkdirAll(path, 0o755); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+			return err
+		}
+		if err := os.WriteFile(path, data, 0o644); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// files builds the archive member files of the spec's format; a nil value is a directory.
+func (s Spec) files() (map[string][]byte, error) {
 	var diffIDs []string
 	var layerTars [][]byte
 	for i, entries := range s.Layers {
 		data, err := layerTar(entries)
 		if err != nil {
-			return fmt.Errorf("layer %d: %w", i, err)
+			return nil, fmt.Errorf("layer %d: %w", i, err)
 		}
 		layerTars = append(layerTars, data)
 		diffIDs = append(diffIDs, newBlob(data).digest)
@@ -109,22 +158,19 @@ func (s Spec) Write(w io.Writer) error {
 
 	config, err := s.config(diffIDs)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
-	out := tar.NewWriter(w)
 	switch s.Format {
 	case LegacySave:
-		err = writeLegacy(out, config, layerTars, diffIDs)
+		return legacyFiles(config, layerTars, diffIDs)
+	case PodmanSave:
+		return podmanFiles(config, layerTars, diffIDs)
 	case OCISave, OCIArchive:
-		err = s.writeOCI(out, config, layerTars)
+		return s.ociFiles(config, layerTars)
 	default:
-		err = fmt.Errorf("unknown format %d", s.Format)
+		return nil, fmt.Errorf("unknown format %d", s.Format)
 	}
-	if err != nil {
-		return err
-	}
-	return out.Close()
 }
 
 func (s Spec) config(diffIDs []string) (blob, error) {
@@ -165,7 +211,7 @@ func (s Spec) config(diffIDs []string) (blob, error) {
 	return newBlob(data), nil
 }
 
-func writeLegacy(out *tar.Writer, config blob, layerTars [][]byte, diffIDs []string) error {
+func legacyFiles(config blob, layerTars [][]byte, diffIDs []string) (map[string][]byte, error) {
 	files := map[string][]byte{}
 	var layerPaths []string
 	parent := ""
@@ -175,7 +221,7 @@ func writeLegacy(out *tar.Writer, config blob, layerTars [][]byte, diffIDs []str
 		id := hex.EncodeToString(sum[:])
 		v1, err := json.Marshal(map[string]any{"id": id, "parent": parent, "created": fixedTime.Format(time.RFC3339)})
 		if err != nil {
-			return err
+			return nil, err
 		}
 		files[id+"/"] = nil
 		files[id+"/VERSION"] = []byte("1.0")
@@ -189,16 +235,38 @@ func writeLegacy(out *tar.Writer, config blob, layerTars [][]byte, diffIDs []str
 
 	manifest, err := json.Marshal([]dockerManifest{{Config: configName, RepoTags: []string{repoTag}, Layers: layerPaths}})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	files["manifest.json"] = manifest
 	if parent != "" {
 		files["repositories"] = []byte(fmt.Sprintf(`{"dive-fixture":{"latest":%q}}`, parent))
 	}
-	return writeSorted(out, files)
+	return files, nil
 }
 
-func (s Spec) writeOCI(out *tar.Writer, config blob, layerTars [][]byte) error {
+// podmanFiles lays out the image the way `podman save` does: the same manifest.json as docker, but
+// flat <diffid-hex>.tar layer files with no per layer VERSION/json metadata.
+func podmanFiles(config blob, layerTars [][]byte, diffIDs []string) (map[string][]byte, error) {
+	files := map[string][]byte{}
+	var layerPaths []string
+	for i, data := range layerTars {
+		name := diffIDs[i][len("sha256:"):] + ".tar"
+		files[name] = data
+		layerPaths = append(layerPaths, name)
+	}
+	configName := config.hex() + ".json"
+	files[configName] = config.data
+
+	manifest, err := json.Marshal([]dockerManifest{{Config: configName, RepoTags: []string{repoTag}, Layers: layerPaths}})
+	if err != nil {
+		return nil, err
+	}
+	files["manifest.json"] = manifest
+	files["repositories"] = []byte(fmt.Sprintf(`{"dive-fixture":{"latest":%q}}`, config.hex()))
+	return files, nil
+}
+
+func (s Spec) ociFiles(config blob, layerTars [][]byte) (map[string][]byte, error) {
 	mediaType := "application/vnd.oci.image.layer.v1.tar"
 	switch s.Compression {
 	case Gzip:
@@ -219,7 +287,7 @@ func (s Spec) writeOCI(out *tar.Writer, config blob, layerTars [][]byte) error {
 	for _, data := range layerTars {
 		compressed, err := compress(data, s.Compression)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		b := newBlob(compressed)
 		layerPaths = append(layerPaths, add(b))
@@ -239,7 +307,7 @@ func (s Spec) writeOCI(out *tar.Writer, config blob, layerTars [][]byte) error {
 		Layers:        layerDescs,
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	manifestBlob := newBlob(manifest)
 	add(manifestBlob)
@@ -258,7 +326,7 @@ func (s Spec) writeOCI(out *tar.Writer, config blob, layerTars [][]byte) error {
 		}},
 	})
 	if err != nil {
-		return err
+		return nil, err
 	}
 	files["index.json"] = index
 	files["oci-layout"] = []byte(`{"imageLayoutVersion":"1.0.0"}`)
@@ -266,12 +334,12 @@ func (s Spec) writeOCI(out *tar.Writer, config blob, layerTars [][]byte) error {
 	if s.Format == OCISave {
 		dm, err := json.Marshal([]dockerManifest{{Config: configPath, RepoTags: []string{repoTag}, Layers: layerPaths}})
 		if err != nil {
-			return err
+			return nil, err
 		}
 		files["manifest.json"] = dm
 		files["repositories"] = []byte(fmt.Sprintf(`{"dive-fixture":{"latest":%q}}`, config.hex()))
 	}
-	return writeSorted(out, files)
+	return files, nil
 }
 
 // writeSorted writes files in name order; a nil value is written as a directory.

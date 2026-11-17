@@ -24,6 +24,7 @@ import (
 	"github.com/anchore/stereoscope/pkg/image/podman"
 
 	"github.com/wagoodman/dive/internal/bus"
+	"github.com/wagoodman/dive/internal/image/archive"
 )
 
 // image sources selectable with a reference scheme or the --source flag
@@ -230,10 +231,12 @@ func providers(src, ref, goos string, platform *image.Platform, tmp *file.TempDi
 		// same as podman.NewDaemonProvider, without its ssh fallback (see newPodmanClient)
 		podmanDaemon = docker.NewAPIClientProvider(string(podman.Daemon), tmp, ref, platform, newPodmanClient)
 		// a stub that always errors unless built with the containers_image_openpgp tag
-		store         = containerstorage.NewProvider(tmp, ref, platform)
-		dockerArchive = docker.NewArchiveProvider(tmp, ref)
-		ociArchive    = oci.NewArchiveProviderWithPlatform(tmp, ref, platform)
-		ociDir        = oci.NewDirectoryProviderWithPlatform(tmp, ref, platform)
+		store = containerstorage.NewProvider(tmp, ref, platform)
+		// archives are read by dive's own parser (internal/image/archive); docker-archive accepts an
+		// OCI layout tarball too, as the stereoscope fallback chain before it did
+		dockerArchive = newArchiveProvider(DockerArchive, tmp, ref, nil, "")
+		ociArchive    = newArchiveProvider(OCIArchive, tmp, ref, platform, archive.FormatOCI)
+		ociDir        = newArchiveProvider(OCIDir, tmp, ref, platform, archive.FormatOCI)
 		// zero registry options mean credentials come from the docker config keychain
 		registry         = oci.NewRegistryProvider(tmp, image.RegistryOptions{}, ref, platform)
 		containerdDaemon = containerd.NewDaemonProvider(tmp, image.RegistryOptions{}, os.Getenv("CONTAINERD_NAMESPACE"), ref, platform)
@@ -253,8 +256,8 @@ func providers(src, ref, goos string, platform *image.Platform, tmp *file.TempDi
 		}
 		return []image.Provider{podmanDaemon}, nil
 	case DockerArchive:
-		// main's own parser read OCI archives as docker-archive too
-		return []image.Provider{dockerArchive, ociArchive}, nil
+		// one provider reads both the docker save and the OCI layout tarballs
+		return []image.Provider{dockerArchive}, nil
 	case OCIArchive:
 		return []image.Provider{ociArchive}, nil
 	case OCIDir:

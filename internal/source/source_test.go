@@ -132,7 +132,7 @@ func TestProviders(t *testing.T) {
 		{src: Podman, goos: "linux", want: []string{"containers-storage", "containers-storage", "podman"}},
 		{src: Podman, goos: "darwin", want: []string{"podman"}},
 		{src: Podman, goos: "windows", want: []string{"podman"}},
-		{src: DockerArchive, goos: "linux", want: []string{"docker-archive", "oci-archive"}},
+		{src: DockerArchive, goos: "linux", want: []string{"docker-archive"}},
 		{src: OCIArchive, goos: "linux", want: []string{"oci-archive"}},
 		{src: OCIDir, goos: "linux", want: []string{"oci-dir"}},
 		{src: Registry, goos: "linux", want: []string{"oci-registry"}},
@@ -165,6 +165,19 @@ func TestLoad(t *testing.T) {
 	dockerSave := imagefixture.Path(t, "oci-save")
 	ociArchive := imagefixture.Path(t, "oci-archive-gzip")
 
+	// the same image as a podman save and as an OCI layout directory
+	podmanSpec := imagefixture.Fixtures()["empty-layer-history"]
+	podmanSpec.Format = imagefixture.PodmanSave
+	podmanSave := filepath.Join(t.TempDir(), "podman.tar")
+	f, err := os.Create(podmanSave)
+	require.NoError(t, err)
+	require.NoError(t, podmanSpec.Write(f))
+	require.NoError(t, f.Close())
+	ociDirSpec := imagefixture.Fixtures()["empty-layer-history"]
+	ociDirSpec.Format = imagefixture.OCIArchive
+	ociDir := filepath.Join(t.TempDir(), "layout")
+	require.NoError(t, ociDirSpec.WriteDir(ociDir))
+
 	tests := []struct {
 		name       string
 		input      string
@@ -176,6 +189,8 @@ func TestLoad(t *testing.T) {
 		{name: "docker-tar default", input: dockerSave, cfg: Config{Source: "docker-tar"}, wantLayers: 3},
 		{name: "oci-archive stereoscope scheme", input: "oci-archive:" + ociArchive, wantLayers: 1},
 		{name: "docker-archive reads an OCI archive", input: ociArchive, cfg: Config{Source: DockerArchive}, wantLayers: 1},
+		{name: "docker-archive reads a podman save", input: "docker-archive://" + podmanSave, wantLayers: 3},
+		{name: "oci-dir reads a layout directory", input: "oci-dir:" + ociDir, wantLayers: 3},
 		{name: "auto detects an archive", input: ociArchive, cfg: Config{Source: Auto}, wantLayers: 1},
 		{name: "missing archive", input: "docker-archive://" + filepath.Join(t.TempDir(), "nope.tar"), wantErr: true},
 		{name: "unknown source", input: dockerSave, cfg: Config{Source: "nope"}, wantErr: true},
@@ -207,13 +222,14 @@ func TestLoad_publishesFailedSources(t *testing.T) {
 	require.Error(t, err)
 	require.NoError(t, sub.Unsubscribe())
 
-	// the UI fails the rows of each attempt on these
+	// the UI fails the rows of each attempt on these; docker-archive is a single provider now that
+	// one parser reads both the docker save and the OCI layouts
 	var failed []any
 	for e := range sub.Events() {
 		assert.Error(t, e.Error)
 		failed = append(failed, e.Source)
 	}
-	assert.Equal(t, []any{"docker-archive", "oci-archive"}, failed)
+	assert.Equal(t, []any{"docker-archive"}, failed)
 }
 
 func TestLoad_interrupted(t *testing.T) {
